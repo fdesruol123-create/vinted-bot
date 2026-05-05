@@ -17,9 +17,34 @@ HEADERS = {
     "Connection": "keep-alive",
 }
 
+# Endpoints connus de l'API Vinted (tentés dans l'ordre)
+CURRENT_USER_ENDPOINTS = [
+    "/api/v2/users/current",
+    "/api/v2/profile",
+]
+
+TOKEN_REFRESH_ENDPOINTS = [
+    "/api/v2/token_refresh",
+    "/api/v2/auth/token_refresh",
+    "/oauth/token",
+]
+
 
 class VintedAuthError(Exception):
     pass
+
+
+def _safe_json(resp: requests.Response) -> dict:
+    """Parse JSON en loggant le contenu brut si ça échoue."""
+    try:
+        return resp.json()
+    except Exception:
+        preview = resp.text[:300] if resp.text else "(réponse vide)"
+        logger.error(
+            f"Réponse non-JSON reçue (HTTP {resp.status_code}) "
+            f"depuis {resp.url} : {preview}"
+        )
+        raise
 
 
 class VintedClient:
@@ -27,7 +52,7 @@ class VintedClient:
         self.domain = domain
         self.base_url = f"https://www.vinted.{domain}"
         self.api = f"{self.base_url}/api/v2"
-        self.refresh_token = refresh_token
+        self._refresh_token = refresh_token
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
         self.user_id: Optional[int] = None
@@ -39,57 +64,94 @@ class VintedClient:
     def _set_token(self, token: str) -> None:
         self.session.headers["Authorization"] = f"Bearer {token}"
 
-    def _refresh(self) -> None:
+    def _fetch_xsrf(self) -> None:
+        try:
+            resp = self.session.get(self.base_url, timeout=15)
+            xsrf = self.session.cookies.get("XSRF-TOKEN", "")
+            if xsrf:
+                self.session.headers["X-XSRF-TOKEN"] = xsrf
+        except Exception as exc:
+            logger.warning(f"Impossible de récupérer le XSRF token : {exc}")
+
+    def _do_refresh(self) -> None:
         logger.info("Token expiré, renouvellement en cours...")
-        resp = self.session.post(
-            f"{self.api}/token_refresh",
-            json={"refresh_token": self.refresh_token},
-            timeout=15,
+        last_error = None
+        for endpoint in TOKEN_REFRESH_ENDPOINTS:
+            url = f"{self.base_url}{endpoint}"
+            try:
+                resp = self.session.post(
+                    url,
+                    json={"refresh_token": self._refresh_token},
+                    timeout=15,
+                )
+                if resp.status_code == 404:
+                    continue
+                if resp.status_code != 200:
+                    last_error = f"HTTP {resp.status_code} sur {url}"
+                    continue
+                data = _safe_json(resp)
+                new_token = data.get("access_token") or data.get("token")
+                if new_token:
+                    self._set_token(new_token)
+                    logger.info("Token renouvelé avec succès.")
+                    return
+            except Exception as exc:
+                last_error = str(exc)
+                continue
+        raise VintedAuthError(
+            f"Impossible de renouveler le token ({last_error}). "
+            "Mets à jour VINTED_ACCESS_TOKEN et VINTED_REFRESH_TOKEN dans Railway."
         )
-        if resp.status_code != 200:
-            raise VintedAuthError(
-                "Impossible de renouveler le token. "
-                "Mets à jour VINTED_REFRESH_TOKEN dans Railway."
-            )
-        data = resp.json()
-        new_access = data.get("access_token") or data.get("token")
-        if not new_access:
-            raise VintedAuthError(f"Réponse de refresh inattendue : {resp.text[:200]}")
-        self._set_token(new_access)
-        logger.info("Token renouvelé avec succès.")
 
     def _verify(self) -> None:
         logger.info("Vérification de la connexion Vinted...")
-        resp = self.session.get(self.base_url, timeout=15)
-        xsrf = self.session.cookies.get("XSRF-TOKEN", "")
-        if xsrf:
-            self.session.headers["X-XSRF-TOKEN"] = xsrf
+        self._fetch_xsrf()
 
-        resp = self.session.get(f"{self.api}/users/current", timeout=15)
-        if resp.status_code == 401:
-            self._refresh()
-            resp = self.session.get(f"{self.api}/users/current", timeout=15)
-        if resp.status_code != 200:
-            raise VintedAuthError(f"Erreur inattendue (HTTP {resp.status_code})")
+        user = None
+        for endpoint in CURRENT_USER_ENDPOINTS:
+            url = f"{self.base_url}{endpoint}"
+            resp = self.session.get(url, timeout=15)
+            logger.debug(f"GET {url} → HTTP {resp.status_code}")
 
-        data = resp.json()
-        user = data.get("user") or data.get("current_user") or data
-        if isinstance(user, dict) and "user" in user:
-            user = user["user"]
-        self.user_id = user.get("id")
-        logger.info(f"Connecté en tant que {user.get('login', '?')} (id={self.user_id})")
+            if resp.status_code == 404:
+                continue
+            if resp.status_code == 401:
+                self._do_refresh()
+                resp = self.session.get(url, timeout=15)
+            if resp.status_code == 200:
+                data = _safe_json(resp)
+                user = (
+                    data.get("user")
+                    or data.get("current_user")
+                    or (data if "id" in data else None)
+                )
+                if isinstance(user, dict) and "user" in user:
+                    user = user["user"]
+                if user and user.get("id"):
+                    break
+
+        if not user or not user.get("id"):
+            raise VintedAuthError(
+                "Impossible de récupérer le profil utilisateur. "
+                "Vérifie que tes tokens sont corrects."
+            )
+
+        self.user_id = user["id"]
+        logger.info(f"Connecté : {user.get('login', '?')} (id={self.user_id})")
+
+    # ------------------------------------------------------------------ wrappers HTTP
 
     def _get(self, url: str, **kwargs) -> requests.Response:
         resp = self.session.get(url, timeout=15, **kwargs)
         if resp.status_code == 401:
-            self._refresh()
+            self._do_refresh()
             resp = self.session.get(url, timeout=15, **kwargs)
         return resp
 
     def _post(self, url: str, **kwargs) -> requests.Response:
         resp = self.session.post(url, timeout=15, **kwargs)
         if resp.status_code == 401:
-            self._refresh()
+            self._do_refresh()
             resp = self.session.post(url, timeout=15, **kwargs)
         return resp
 
@@ -103,7 +165,7 @@ class VintedClient:
                 params={"page": page, "per_page": 96},
             )
             resp.raise_for_status()
-            items = resp.json().get("items", [])
+            items = _safe_json(resp).get("items", [])
             if not items:
                 break
             all_items.extend(items)
@@ -123,7 +185,7 @@ class VintedClient:
         if resp.status_code == 404:
             return []
         resp.raise_for_status()
-        return resp.json().get("users", [])
+        return _safe_json(resp).get("users", [])
 
     # ------------------------------------------------------------------ conversations
 
@@ -133,12 +195,12 @@ class VintedClient:
             params={"page": 1, "per_page": 50},
         )
         resp.raise_for_status()
-        return resp.json().get("conversations", [])
+        return _safe_json(resp).get("conversations", [])
 
     def get_messages(self, conv_id: int) -> list:
         resp = self._get(f"{self.api}/conversations/{conv_id}/messages")
         resp.raise_for_status()
-        return resp.json().get("messages", [])
+        return _safe_json(resp).get("messages", [])
 
     def reply(self, conv_id: int, body: str) -> dict:
         resp = self._post(
@@ -146,7 +208,7 @@ class VintedClient:
             json={"message": {"body": body}},
         )
         resp.raise_for_status()
-        return resp.json()
+        return _safe_json(resp)
 
     def start_conversation(self, to_user_id: int, item_id: int, body: str) -> Optional[dict]:
         resp = self._post(
@@ -160,10 +222,10 @@ class VintedClient:
             },
         )
         if resp.status_code in (200, 201):
-            return resp.json()
+            return _safe_json(resp)
         logger.warning(
             f"Impossible de créer la conversation user={to_user_id} item={item_id} "
-            f"(HTTP {resp.status_code})"
+            f"(HTTP {resp.status_code}) : {resp.text[:150]}"
         )
         return None
 
