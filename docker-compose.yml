@@ -1,0 +1,10 @@
+version: "3.9"
+
+services:
+  vinted-bot:
+    build: .
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data   # Sauvegarde l'état entre les redémarrages
