@@ -23,48 +23,49 @@ class VintedAuthError(Exception):
 
 
 class VintedClient:
-    def __init__(self, username: str, password: str, domain: str = "fr"):
+    def __init__(self, session_cookie: str, domain: str = "fr"):
+        self.domain = domain
         self.base_url = f"https://www.vinted.{domain}"
         self.api = f"{self.base_url}/api/v2"
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
         self.user_id: Optional[int] = None
-        self._login(username, password)
+        self._authenticate(session_cookie)
 
     # ------------------------------------------------------------------ auth
 
-    def _fetch_csrf(self) -> str:
+    def _authenticate(self, session_cookie: str) -> None:
+        logger.info("Connexion à Vinted via cookie de session...")
+
+        # Visite la page principale pour récupérer le XSRF-TOKEN
         resp = self.session.get(self.base_url, timeout=15)
         resp.raise_for_status()
-        token = self.session.cookies.get("XSRF-TOKEN", "")
-        if token:
-            self.session.headers["X-XSRF-TOKEN"] = token
-        return token
 
-    def _login(self, username: str, password: str) -> None:
-        logger.info("Connexion à Vinted en cours...")
-        self._fetch_csrf()
-        resp = self.session.post(
-            f"{self.api}/users/login",
-            json={
-                "user": {
-                    "login": username,
-                    "password": password,
-                    "remember": True,
-                }
-            },
-            timeout=15,
-        )
+        # Injecte le cookie de session Vinted
+        cookie_name = f"_vinted_{self.domain}_session"
+        self.session.cookies.set(cookie_name, session_cookie, domain=f"www.vinted.{self.domain}")
+
+        # Récupère le XSRF token et l'ajoute aux headers
+        xsrf = self.session.cookies.get("XSRF-TOKEN", "")
+        if xsrf:
+            self.session.headers["X-XSRF-TOKEN"] = xsrf
+
+        # Vérifie que le cookie est valide en récupérant le profil
+        resp = self.session.get(f"{self.api}/users/current", timeout=15)
+        if resp.status_code == 401:
+            raise VintedAuthError(
+                "Cookie de session invalide ou expiré. "
+                "Récupère un nouveau cookie depuis ton navigateur (voir README)."
+            )
         if resp.status_code != 200:
             raise VintedAuthError(
-                f"Échec de connexion (HTTP {resp.status_code}) : {resp.text[:200]}"
+                f"Erreur inattendue (HTTP {resp.status_code}) : {resp.text[:200]}"
             )
-        data = resp.json()
-        user = data.get("user") or data.get("current_user")
-        if not user:
-            raise VintedAuthError(f"Réponse inattendue : {resp.text[:200]}")
-        self.user_id = user["id"]
-        logger.info(f"Connecté en tant que {user.get('login')} (id={self.user_id})")
+
+        user = resp.json().get("user") or resp.json().get("current_user") or resp.json()
+        self.user_id = user.get("id") or user.get("user", {}).get("id")
+        login = user.get("login") or user.get("user", {}).get("login", "inconnu")
+        logger.info(f"Connecté en tant que {login} (id={self.user_id})")
 
     # ------------------------------------------------------------------ items
 
@@ -142,7 +143,6 @@ class VintedClient:
         )
         if resp.status_code in (200, 201):
             return resp.json()
-        # Conversation déjà existante : récupérer l'id depuis les headers ou la réponse
         logger.warning(
             f"Impossible de créer la conversation avec user={to_user_id} item={item_id} "
             f"(HTTP {resp.status_code})"

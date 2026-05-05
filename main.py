@@ -18,20 +18,22 @@ logger = logging.getLogger(__name__)
 
 
 def main() -> None:
-    username = os.environ.get("VINTED_USERNAME")
-    password = os.environ.get("VINTED_PASSWORD")
+    session_cookie = os.environ.get("VINTED_SESSION_COOKIE")
     domain = os.environ.get("VINTED_DOMAIN", "fr")
     interval = int(os.environ.get("CHECK_INTERVAL_SECONDS", "300"))
 
-    if not username or not password:
-        logger.error("Variables manquantes : VINTED_USERNAME et VINTED_PASSWORD sont requis.")
+    if not session_cookie:
+        logger.error(
+            "Variable manquante : VINTED_SESSION_COOKIE est requis. "
+            "Récupère ton cookie de session depuis ton navigateur (voir le guide)."
+        )
         sys.exit(1)
 
     from src.vinted_client import VintedClient, VintedAuthError
     from src.bot import VintedBot
 
     try:
-        client = VintedClient(username, password, domain)
+        client = VintedClient(session_cookie, domain)
     except VintedAuthError as exc:
         logger.error(f"Échec de l'authentification Vinted : {exc}")
         sys.exit(1)
