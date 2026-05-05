@@ -1,32 +1,33 @@
 import logging
+import os
 import time
+import random
 import requests
+from playwright.sync_api import sync_playwright
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+SESSION_FILE = os.environ.get("SESSION_FILE", "data/playwright_session.json")
+
 HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     ),
     "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
+    "Accept-Language": "fr-FR,fr;q=0.9",
+    "Accept-Encoding": "gzip, deflate",
 }
 
-# Endpoints connus de l'API Vinted (tentés dans l'ordre)
-CURRENT_USER_ENDPOINTS = [
-    "/api/v2/users/current",
-    "/api/v2/profile",
-]
-
-TOKEN_REFRESH_ENDPOINTS = [
-    "/api/v2/token_refresh",
-    "/api/v2/auth/token_refresh",
-    "/oauth/token",
+CHROMIUM_ARGS = [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--disable-extensions",
+    "--single-process",
+    "--no-zygote",
 ]
 
 
@@ -34,125 +35,158 @@ class VintedAuthError(Exception):
     pass
 
 
-def _safe_json(resp: requests.Response) -> dict:
-    """Parse JSON en loggant le contenu brut si ça échoue."""
-    try:
-        return resp.json()
-    except Exception:
-        preview = resp.text[:300] if resp.text else "(réponse vide)"
-        logger.error(
-            f"Réponse non-JSON reçue (HTTP {resp.status_code}) "
-            f"depuis {resp.url} : {preview}"
-        )
-        raise
-
-
 class VintedClient:
-    def __init__(self, access_token: str, refresh_token: str, domain: str = "fr"):
+    def __init__(self, email: str, password: str, domain: str = "fr"):
+        self.email = email
+        self.password = password
         self.domain = domain
         self.base_url = f"https://www.vinted.{domain}"
         self.api = f"{self.base_url}/api/v2"
-        self._refresh_token = refresh_token
-        self.session = requests.Session()
-        self.session.headers.update(HEADERS)
+        self.http = requests.Session()
+        self.http.headers.update(HEADERS)
         self.user_id: Optional[int] = None
-        self._set_token(access_token)
-        self._verify()
+        self._authenticate()
 
     # ------------------------------------------------------------------ auth
 
-    def _set_token(self, token: str) -> None:
-        self.session.headers["Authorization"] = f"Bearer {token}"
+    def _authenticate(self) -> None:
+        logger.info("Lancement du navigateur pour authentification...")
+        token_box: list = []
 
-    def _fetch_xsrf(self) -> None:
-        try:
-            resp = self.session.get(self.base_url, timeout=15)
-            xsrf = self.session.cookies.get("XSRF-TOKEN", "")
-            if xsrf:
-                self.session.headers["X-XSRF-TOKEN"] = xsrf
-        except Exception as exc:
-            logger.warning(f"Impossible de récupérer le XSRF token : {exc}")
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True, args=CHROMIUM_ARGS)
 
-    def _do_refresh(self) -> None:
-        logger.info("Token expiré, renouvellement en cours...")
-        last_error = None
-        for endpoint in TOKEN_REFRESH_ENDPOINTS:
-            url = f"{self.base_url}{endpoint}"
-            try:
-                resp = self.session.post(
-                    url,
-                    json={"refresh_token": self._refresh_token},
-                    timeout=15,
-                )
-                if resp.status_code == 404:
-                    continue
-                if resp.status_code != 200:
-                    last_error = f"HTTP {resp.status_code} sur {url}"
-                    continue
-                data = _safe_json(resp)
-                new_token = data.get("access_token") or data.get("token")
-                if new_token:
-                    self._set_token(new_token)
-                    logger.info("Token renouvelé avec succès.")
-                    return
-            except Exception as exc:
-                last_error = str(exc)
-                continue
-        raise VintedAuthError(
-            f"Impossible de renouveler le token ({last_error}). "
-            "Mets à jour VINTED_ACCESS_TOKEN et VINTED_REFRESH_TOKEN dans Railway."
-        )
+            ctx_kwargs: dict = {"user_agent": HEADERS["User-Agent"], "locale": "fr-FR"}
+            if os.path.exists(SESSION_FILE):
+                logger.info("Restauration de la session précédente...")
+                ctx_kwargs["storage_state"] = SESSION_FILE
 
-    def _verify(self) -> None:
-        logger.info("Vérification de la connexion Vinted...")
-        self._fetch_xsrf()
+            ctx = browser.new_context(**ctx_kwargs)
+            page = ctx.new_page()
 
-        user = None
-        for endpoint in CURRENT_USER_ENDPOINTS:
-            url = f"{self.base_url}{endpoint}"
-            resp = self.session.get(url, timeout=15)
-            logger.debug(f"GET {url} → HTTP {resp.status_code}")
+            # Capture le Bearer token depuis les requêtes sortantes
+            def on_request(req):
+                auth = req.headers.get("authorization", "")
+                if auth.startswith("Bearer ") and "/api/v2/" in req.url:
+                    t = auth[7:]
+                    if t not in token_box:
+                        token_box.append(t)
 
-            if resp.status_code == 404:
-                continue
-            if resp.status_code == 401:
-                self._do_refresh()
-                resp = self.session.get(url, timeout=15)
-            if resp.status_code == 200:
-                data = _safe_json(resp)
-                user = (
-                    data.get("user")
-                    or data.get("current_user")
-                    or (data if "id" in data else None)
-                )
-                if isinstance(user, dict) and "user" in user:
-                    user = user["user"]
-                if user and user.get("id"):
-                    break
+            page.on("request", on_request)
 
-        if not user or not user.get("id"):
+            page.goto(self.base_url, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(2000)
+
+            if not self._is_logged_in(page):
+                logger.info("Connexion au compte Vinted...")
+                self._do_login(page)
+
+            # Charge la messagerie pour déclencher des appels API
+            page.goto(f"{self.base_url}/member/inbox", wait_until="networkidle", timeout=30000)
+            page.wait_for_timeout(2000)
+
+            # Sauvegarde la session pour le prochain démarrage
+            os.makedirs(os.path.dirname(SESSION_FILE), exist_ok=True)
+            ctx.storage_state(path=SESSION_FILE)
+            browser.close()
+
+        if not token_box:
             raise VintedAuthError(
-                "Impossible de récupérer le profil utilisateur. "
-                "Vérifie que tes tokens sont corrects."
+                "Aucun token capturé. Vérifie VINTED_EMAIL et VINTED_PASSWORD."
             )
 
-        self.user_id = user["id"]
+        self.http.headers["Authorization"] = f"Bearer {token_box[-1]}"
+        logger.info("Token capturé avec succès.")
+
+        # Récupère l'identifiant utilisateur
+        resp = self.http.get(f"{self.api}/users/current", timeout=15)
+        if resp.status_code != 200:
+            raise VintedAuthError(f"Profil inaccessible (HTTP {resp.status_code})")
+
+        data = resp.json()
+        user = data.get("user") or data.get("current_user") or data
+        if isinstance(user, dict) and "user" in user:
+            user = user["user"]
+        self.user_id = user.get("id")
         logger.info(f"Connecté : {user.get('login', '?')} (id={self.user_id})")
+
+    def _is_logged_in(self, page) -> bool:
+        selectors = [
+            'a[href*="/member/profile"]',
+            'a[href*="/logout"]',
+            '[data-testid*="user"]',
+            '[class*="userAvatar"]',
+            'img[alt*="avatar"]',
+        ]
+        for sel in selectors:
+            try:
+                if page.query_selector(sel):
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def _do_login(self, page) -> None:
+        # Clic sur "Se connecter"
+        for sel in ['a[href*="login"]', 'a:has-text("Se connecter")', 'button:has-text("Se connecter")']:
+            try:
+                el = page.query_selector(sel)
+                if el:
+                    el.click()
+                    page.wait_for_load_state("domcontentloaded")
+                    break
+            except Exception:
+                pass
+
+        # Remplir email
+        for sel in ['input[name="username"]', 'input[name="user[login]"]', 'input[type="email"]', '#username']:
+            try:
+                el = page.wait_for_selector(sel, timeout=5000)
+                if el:
+                    el.fill(self.email)
+                    break
+            except Exception:
+                pass
+
+        # Remplir mot de passe
+        for sel in ['input[name="password"]', 'input[name="user[password]"]', 'input[type="password"]']:
+            try:
+                el = page.query_selector(sel)
+                if el:
+                    el.fill(self.password)
+                    break
+            except Exception:
+                pass
+
+        # Soumettre
+        for sel in ['button[type="submit"]', 'button:has-text("Connexion")', 'button:has-text("Se connecter")']:
+            try:
+                el = page.query_selector(sel)
+                if el:
+                    el.click()
+                    page.wait_for_load_state("networkidle", timeout=20000)
+                    break
+            except Exception:
+                pass
+
+        if not self._is_logged_in(page):
+            raise VintedAuthError("Connexion échouée. Vérifie VINTED_EMAIL et VINTED_PASSWORD.")
+        logger.info("Connexion réussie.")
 
     # ------------------------------------------------------------------ wrappers HTTP
 
     def _get(self, url: str, **kwargs) -> requests.Response:
-        resp = self.session.get(url, timeout=15, **kwargs)
+        resp = self.http.get(url, timeout=15, **kwargs)
         if resp.status_code == 401:
-            self._do_refresh()
-            resp = self.session.get(url, timeout=15, **kwargs)
+            self._authenticate()
+            resp = self.http.get(url, timeout=15, **kwargs)
         return resp
 
     def _post(self, url: str, **kwargs) -> requests.Response:
-        resp = self.session.post(url, timeout=15, **kwargs)
+        resp = self.http.post(url, timeout=15, **kwargs)
         if resp.status_code == 401:
-            self._do_refresh()
-            resp = self.session.post(url, timeout=15, **kwargs)
+            self._authenticate()
+            resp = self.http.post(url, timeout=15, **kwargs)
         return resp
 
     # ------------------------------------------------------------------ items
@@ -165,7 +199,7 @@ class VintedClient:
                 params={"page": page, "per_page": 96},
             )
             resp.raise_for_status()
-            items = _safe_json(resp).get("items", [])
+            items = resp.json().get("items", [])
             if not items:
                 break
             all_items.extend(items)
@@ -185,22 +219,19 @@ class VintedClient:
         if resp.status_code == 404:
             return []
         resp.raise_for_status()
-        return _safe_json(resp).get("users", [])
+        return resp.json().get("users", [])
 
     # ------------------------------------------------------------------ conversations
 
     def get_conversations(self) -> list:
-        resp = self._get(
-            f"{self.api}/conversations",
-            params={"page": 1, "per_page": 50},
-        )
+        resp = self._get(f"{self.api}/conversations", params={"page": 1, "per_page": 50})
         resp.raise_for_status()
-        return _safe_json(resp).get("conversations", [])
+        return resp.json().get("conversations", [])
 
     def get_messages(self, conv_id: int) -> list:
         resp = self._get(f"{self.api}/conversations/{conv_id}/messages")
         resp.raise_for_status()
-        return _safe_json(resp).get("messages", [])
+        return resp.json().get("messages", [])
 
     def reply(self, conv_id: int, body: str) -> dict:
         resp = self._post(
@@ -208,31 +239,19 @@ class VintedClient:
             json={"message": {"body": body}},
         )
         resp.raise_for_status()
-        return _safe_json(resp)
+        return resp.json()
 
     def start_conversation(self, to_user_id: int, item_id: int, body: str) -> Optional[dict]:
         resp = self._post(
             f"{self.api}/conversations",
-            json={
-                "conversation": {
-                    "to_user_id": to_user_id,
-                    "item_id": item_id,
-                    "body": body,
-                }
-            },
+            json={"conversation": {"to_user_id": to_user_id, "item_id": item_id, "body": body}},
         )
         if resp.status_code in (200, 201):
-            return _safe_json(resp)
-        logger.warning(
-            f"Impossible de créer la conversation user={to_user_id} item={item_id} "
-            f"(HTTP {resp.status_code}) : {resp.text[:150]}"
-        )
+            return resp.json()
+        logger.warning(f"Conversation non créée (HTTP {resp.status_code}) : {resp.text[:100]}")
         return None
 
-    # ------------------------------------------------------------------ helpers
-
     def safe_delay(self, min_sec: float = 30, max_sec: float = 90) -> None:
-        import random
         delay = random.uniform(min_sec, max_sec)
         logger.debug(f"Pause {delay:.0f}s...")
         time.sleep(delay)
